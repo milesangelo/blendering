@@ -36,5 +36,5 @@ def test_reframe_script_does_not_change_focal_length() -> None:
 
 def test_reframe_script_excludes_lights_and_cameras() -> None:
     script = reframe_script(padding=0.15, min_distance=2.0, exclude_tags=[])
-    # AABB must ignore non-content objects.
-    assert "MESH" in script  # filtering by object.type
+    # The script must filter scene objects to mesh only.
+    assert 'o.type == "MESH"' in script

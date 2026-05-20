@@ -24,7 +24,7 @@ def reframe_script(
     return f"""
 import bpy
 import math
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 padding = {float(padding)}
 min_distance = {float(min_distance)}
@@ -60,12 +60,18 @@ else:
         cam.location = centroid + Vector((radius, -radius, radius))
 
     # Aim camera at centroid via track-to math.
-    direction = (cam.location - centroid).normalized()
-    if direction.length == 0.0:
+    raw = cam.location - centroid
+    if raw.length < 1e-4:
         direction = Vector((1.0, -1.0, 1.0)).normalized()
+    else:
+        direction = raw.normalized()
 
     # Solve dolly distance so the bounding sphere fits the camera frustum.
-    fov = cam.data.angle if cam.data.type != "ORTHO" else math.radians(50.0)
+    fov = (
+        min(cam.data.angle, cam.data.angle_y)
+        if cam.data.type != "ORTHO"
+        else math.radians(50.0)
+    )
     fit_distance = radius / max(math.sin(fov / 2.0), 1e-4)
     distance = max(fit_distance, min_distance)
     cam.location = centroid + direction * distance
@@ -80,8 +86,7 @@ else:
         right = look.cross(up)
     right = right.normalized()
     new_up = right.cross(look).normalized()
-    import mathutils
-    mat = mathutils.Matrix((
+    mat = Matrix((
         (right.x, new_up.x, -look.x, cam.location.x),
         (right.y, new_up.y, -look.y, cam.location.y),
         (right.z, new_up.z, -look.z, cam.location.z),
