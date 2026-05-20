@@ -9,10 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .llm import judge, stream_actor
+from .cost import CostMeter
+from .framing import reframe_script
+from .llm import judge, plan, replan, stream_actor
 from .mcp_client import BlenderMCP, mcp_client
 from .prompts import ACTOR_SYSTEM, CRITIC_SYSTEM
-from .schemas import RunOutcome, Verdict
+from .schemas import PartProposal, Plan, RunOutcome, Verdict, VerifierDiff
+from .verifier import verify
 from .tui.events import (
     ActorTextDelta,
     CriticVerdictEvent,
@@ -28,6 +31,9 @@ from .utils.images import save_screenshot
 from .utils.logging import get_logger
 
 log = get_logger("blendering.orchestrator")
+
+# Test seam: most-recent run's accumulated proposals. Tests assert against this.
+_LAST_PROPOSALS: list[PartProposal] = []
 
 
 class EventBus:
@@ -69,6 +75,17 @@ def _truncate(text: str, n: int = 400) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def _extract_proposals(text: str) -> list[PartProposal]:
+    out: list[PartProposal] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("PROPOSED_ADDITION:"):
+            desc = stripped.split(":", 1)[1].strip()
+            if desc:
+                out.append(PartProposal(description=desc))
+    return out
+
+
 async def _run_actor_turn(
     settings: Settings,
     mcp: BlenderMCP,
@@ -76,11 +93,13 @@ async def _run_actor_turn(
     tools_openai: list[dict[str, Any]],
     bus: EventBus,
     cancel: asyncio.Event,
-) -> tuple[list[dict[str, Any]], str]:
-    """Run one Actor turn (text + tool calls). Returns (new_messages, transcript_for_critic)."""
+    meter: CostMeter,
+) -> tuple[list[dict[str, Any]], str, list[PartProposal]]:
+    """Run one Actor turn (text + tool calls). Returns (new_messages, transcript_for_critic, proposals)."""
     accumulated_text = ""
     appended: list[dict[str, Any]] = []
     transcript_lines: list[str] = []
+    proposals: list[PartProposal] = []
 
     # The Actor may emit text then tool calls. We loop: stream → execute tool calls →
     # feed results back → stream again, until the model finishes without tool calls.
@@ -98,6 +117,8 @@ async def _run_actor_turn(
                     await bus.post(ActorTextDelta(delta.text))
                 if delta.finished_tool_calls:
                     finished.extend(delta.finished_tool_calls)
+                if delta.in_tokens is not None and delta.out_tokens is not None:
+                    meter.actor.add(delta.in_tokens, delta.out_tokens)
             log.debug("actor: stream complete — %d chars text, %d tool calls",
                       len(text), len(finished))
             return text, finished
@@ -108,12 +129,13 @@ async def _run_actor_turn(
         accumulated_text += text
         if text:
             transcript_lines.append(f"[actor] {_truncate(text)}")
+            proposals.extend(_extract_proposals(text))
 
         if not finished_tool_calls:
             # Plain text completion — record and return.
             messages.append({"role": "assistant", "content": text or ""})
             appended.append(messages[-1])
-            return appended, "\n".join(transcript_lines)
+            return appended, "\n".join(transcript_lines), proposals
 
         # Append the assistant tool-calls message
         tool_calls_payload = [
@@ -169,6 +191,54 @@ async def _run_actor_turn(
             appended.append(messages[-1])
 
 
+async def gather_scene_snapshot(mcp: BlenderMCP, plan: Plan) -> dict[str, Any]:
+    """Snapshot all mesh objects in the scene in the shape the Verifier expects.
+    Uses a single execute_blender_code call to inspect everything at once —
+    cheaper than N per-object MCP round-trips."""
+    script = """
+import bpy, json
+out = {"objects": {}}
+for o in bpy.context.scene.objects:
+    if o.type != "MESH":
+        continue
+    me = o.data
+    vert_count = len(me.vertices) if me else 0
+    mn = [float("inf")] * 3
+    mx = [float("-inf")] * 3
+    import mathutils
+    for corner in o.bound_box:
+        wc = o.matrix_world @ mathutils.Vector(corner)
+        for i in range(3):
+            mn[i] = min(mn[i], wc[i])
+            mx[i] = max(mx[i], wc[i])
+    rot_deg = [r * 180.0 / 3.141592653589793 for r in o.rotation_euler]
+    if vert_count == 8:
+        prim = "cube"
+    elif vert_count == 4:
+        prim = "plane"
+    else:
+        prim = "mesh"
+    out["objects"][o.name] = {
+        "primitive_guess": prim,
+        "vert_count": vert_count,
+        "world_location": [o.location.x, o.location.y, o.location.z],
+        "world_bbox_min": mn,
+        "world_bbox_max": mx,
+        "rotation_euler_deg": rot_deg,
+    }
+print(json.dumps(out))
+"""
+    result = await mcp.call_tool("execute_blender_code", {"code": script})
+    text = (result.text or "").strip()
+    start = text.rfind("{")
+    if start < 0:
+        return {"objects": {}}
+    try:
+        return json.loads(text[start:])
+    except json.JSONDecodeError:
+        return {"objects": {}}
+
+
 async def run(
     settings: Settings,
     user_prompt: str,
@@ -189,15 +259,37 @@ async def run(
                 StatusMessage(text=f"MCP connected. {len(tools_openai)} tools available.")
             )
 
+            meter = CostMeter()
+
+            # Initial plan
+            planner_cfg = settings.planner or settings.actor
+            plan_task = asyncio.create_task(plan(planner_cfg, user_prompt))
+            current_plan, p_in, p_out = await _wait_or_cancel(plan_task, cancel)
+            meter.planner.add(p_in, p_out)
+            await bus.post(
+                StatusMessage(
+                    text=f"Plan v{current_plan.version}: "
+                    f"{len(current_plan.parts)} part(s) — "
+                    f"{', '.join(p.id for p in current_plan.parts) or '(none)'}"
+                )
+            )
+
+            actor_system = (
+                ACTOR_SYSTEM + "\n\nACTIVE PLAN:\n" + current_plan.model_dump_json(indent=2)
+            )
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": ACTOR_SYSTEM},
+                {"role": "system", "content": actor_system},
                 {"role": "user", "content": user_prompt},
             ]
             stuck_streak = 0
             last_verdict: Verdict | None = None
+            pending_proposals: list[PartProposal] = []
+            replan_count = 0
+            recent_actions_log: list[str] = []  # bounded summary fed to replan
 
             for i in range(1, settings.loop.max_iterations + 1):
                 if cancel.is_set():
+                    _LAST_PROPOSALS[:] = pending_proposals
                     outcome = RunOutcome(
                         status="cancelled", iterations=i - 1, last_verdict=last_verdict
                     )
@@ -207,13 +299,35 @@ async def run(
                 log.info("── iteration %d/%d ──", i, settings.loop.max_iterations)
                 await bus.post(IterationStart(n=i, total=settings.loop.max_iterations))
 
-                _, transcript = await _run_actor_turn(
-                    settings, mcp, messages, tools_openai, bus, cancel
+                _, transcript, new_proposals = await _run_actor_turn(
+                    settings, mcp, messages, tools_openai, bus, cancel, meter
                 )
+                pending_proposals.extend(new_proposals)
+                recent_actions_log.append(transcript[:200])
+                if len(recent_actions_log) > 5:
+                    recent_actions_log.pop(0)
 
-                # Screenshot
+                # Screenshot (preceded by auto-frame when enabled)
                 screenshot_bytes: bytes | None = None
                 if settings.loop.screenshot_every_step:
+                    if settings.framing.auto_frame:
+                        script = reframe_script(
+                            padding=settings.framing.padding,
+                            min_distance=settings.framing.min_distance,
+                            exclude_tags=settings.framing.exclude_tags,
+                        )
+                        frame_task = asyncio.create_task(
+                            mcp.call_tool("execute_blender_code", {"code": script})
+                        )
+                        try:
+                            await _wait_or_cancel(frame_task, cancel)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            await bus.post(
+                                StatusMessage(text=f"Auto-frame failed: {exc}", level="warn")
+                            )
+
                     shot_task = asyncio.create_task(mcp.get_screenshot())
                     try:
                         screenshot_bytes = await _wait_or_cancel(shot_task, cancel)
@@ -229,6 +343,22 @@ async def run(
                             ViewportUpdate(image_bytes=screenshot_bytes, path=str(path))
                         )
 
+                # Verifier — pure code, runs every step.
+                snapshot_task = asyncio.create_task(
+                    gather_scene_snapshot(mcp, current_plan)
+                )
+                try:
+                    snapshot = await _wait_or_cancel(snapshot_task, cancel)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await bus.post(
+                        StatusMessage(text=f"Snapshot failed: {exc}", level="warn")
+                    )
+                    snapshot = {"objects": {}}
+                last_diff: VerifierDiff = verify(current_plan, snapshot, settings.verifier)
+                await bus.post(StatusMessage(text=f"Verifier: {last_diff.summary}"))
+
                 # Critic
                 judge_task = asyncio.create_task(
                     judge(
@@ -237,23 +367,94 @@ async def run(
                         user_prompt,
                         transcript,
                         screenshot_bytes,
+                        plan=current_plan,
+                        diff=last_diff,
                     )
                 )
-                verdict = await _wait_or_cancel(judge_task, cancel)
+                verdict, c_in, c_out = await _wait_or_cancel(judge_task, cancel)
+                meter.critic.add(c_in, c_out)
                 last_verdict = verdict
                 log.info("critic verdict: status=%s confidence=%.2f hint=%r",
                          verdict.status, verdict.confidence, verdict.next_step_hint)
                 await bus.post(CriticVerdictEvent(verdict))
+                step_line = meter.step_line(settings.actor, settings.critic)
+                log.info(step_line)
+                await bus.post(StatusMessage(text=step_line))
 
                 if verdict.status == "done":
+                    summary = meter.summary(settings.actor, settings.critic)
+                    log.info("run summary:\n%s", summary)
+                    await bus.post(StatusMessage(text=summary))
+                    _LAST_PROPOSALS[:] = pending_proposals
                     outcome = RunOutcome(
                         status="done", iterations=i, last_verdict=verdict
                     )
                     await bus.post(RunFinished(outcome))
                     return outcome
+                if verdict.status == "structural_mismatch":
+                    if replan_count < settings.loop.max_replans:
+                        replan_count += 1
+                        await bus.post(
+                            StatusMessage(
+                                text=f"Replanning ({replan_count}/{settings.loop.max_replans}): "
+                                f"{verdict.replan_reason or verdict.reasoning}"
+                            )
+                        )
+                        replan_task = asyncio.create_task(
+                            replan(
+                                settings.planner or settings.actor,
+                                prior=current_plan,
+                                diff=last_diff,
+                                recent_actions="\n".join(recent_actions_log),
+                                proposals=pending_proposals,
+                                screenshot_png=screenshot_bytes,
+                            )
+                        )
+                        try:
+                            new_plan, p_in, p_out = await _wait_or_cancel(replan_task, cancel)
+                        except asyncio.CancelledError:
+                            raise
+                        meter.planner.add(p_in, p_out)
+                        # Diff the plans for the Actor.
+                        prior_ids = {p.id for p in current_plan.parts}
+                        new_ids = {p.id for p in new_plan.parts}
+                        added = sorted(new_ids - prior_ids)
+                        removed = sorted(prior_ids - new_ids)
+                        plan_diff_msg = (
+                            f"Plan revised to v{new_plan.version}. "
+                            f"Added: {added or '[]'}. Removed: {removed or '[]'}."
+                        )
+                        await bus.post(StatusMessage(text=plan_diff_msg))
+
+                        current_plan = new_plan
+                        pending_proposals = []  # consumed by the replan
+                        stuck_streak = 0
+                        # Replace the Actor system prompt so it sees the new plan.
+                        actor_system = (
+                            ACTOR_SYSTEM
+                            + "\n\nACTIVE PLAN:\n"
+                            + current_plan.model_dump_json(indent=2)
+                        )
+                        messages[0] = {"role": "system", "content": actor_system}
+                        messages.append({"role": "user", "content": plan_diff_msg})
+                        continue
+                    else:
+                        # Out of replan budget — downgrade to stuck and fall through.
+                        verdict = verdict.model_copy(
+                            update={
+                                "status": "stuck",
+                                "reasoning": f"structural_mismatch with no replan budget: {verdict.reasoning}",
+                            }
+                        )
+                        last_verdict = verdict
+
                 if verdict.status == "stuck":
                     stuck_streak += 1
                     if stuck_streak >= settings.loop.stop_on_stuck_streak:
+                        summary = meter.summary(settings.actor, settings.critic)
+                        log.info("run summary:\n%s", summary)
+                        await bus.post(StatusMessage(text=summary))
+                        _LAST_PROPOSALS[:] = pending_proposals
                         outcome = RunOutcome(
                             status="stuck", iterations=i, last_verdict=verdict
                         )
@@ -262,8 +463,14 @@ async def run(
                 else:
                     stuck_streak = 0
 
-                # Inject critic feedback for next iteration.
+                # Inject Verifier + Critic feedback for next iteration.
+                off_lines = "\n".join(
+                    f"  - {p.part_id} ({p.status}): {'; '.join(p.issues) if p.issues else 'ok'}"
+                    for p in last_diff.parts
+                )
                 feedback = (
+                    f"VERIFIER DIFF (plan v{last_diff.plan_version}): {last_diff.summary}\n"
+                    f"{off_lines}\n"
                     f"Critic feedback (status={verdict.status}, "
                     f"confidence={verdict.confidence:.2f}):\n"
                     f"{verdict.reasoning}\n"
@@ -271,6 +478,10 @@ async def run(
                 )
                 messages.append({"role": "user", "content": feedback})
 
+            summary = meter.summary(settings.actor, settings.critic)
+            log.info("run summary:\n%s", summary)
+            await bus.post(StatusMessage(text=summary))
+            _LAST_PROPOSALS[:] = pending_proposals
             outcome = RunOutcome(
                 status="max_iterations",
                 iterations=settings.loop.max_iterations,
@@ -280,12 +491,14 @@ async def run(
             return outcome
 
     except asyncio.CancelledError:
+        _LAST_PROPOSALS[:] = []
         outcome = RunOutcome(status="cancelled", iterations=0)
         bus.post_nowait(RunFinished(outcome))
         return outcome
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
+        _LAST_PROPOSALS[:] = []
         outcome = RunOutcome(status="error", iterations=0, error=f"{exc!r}\n{tb}")
         bus.post_nowait(RunFinished(outcome))
         return outcome

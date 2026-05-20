@@ -13,7 +13,7 @@ from blendering.config import LoopConfig, MCPConfig, ModelConfig, Settings
 from blendering.llm import ActorDelta
 from blendering.mcp_client import BlenderMCP, ToolResult, ToolSpec
 from blendering.orchestrator import EventBus, run
-from blendering.schemas import Verdict
+from blendering.schemas import PartSpec, Plan, PositionSpec, Verdict
 from blendering.tui.events import (
     CriticVerdictEvent,
     IterationStart,
@@ -61,6 +61,7 @@ class FakeMCP(BlenderMCP):
         return ToolResult(text=f"ran {name}", image_bytes=None, is_error=False)
 
     async def get_screenshot(self, max_size: int = 1024) -> bytes | None:
+        self.calls.append(("get_screenshot", {"max_size": max_size}))
         return None
 
 
@@ -110,18 +111,55 @@ def _make_stream(
 def _patch_judge(monkeypatch: pytest.MonkeyPatch, verdicts: list[Verdict]) -> None:
     it = iter(verdicts)
 
-    async def fake_judge(*_args: Any, **_kwargs: Any) -> Verdict:
+    async def fake_judge(*_args: Any, **_kwargs: Any) -> tuple[Verdict, int, int]:
         try:
-            return next(it)
+            return next(it), 100, 50
         except StopIteration:
-            return Verdict(status="done", reasoning="default", confidence=1.0)
+            return Verdict(status="done", reasoning="default", confidence=1.0), 100, 50
 
     monkeypatch.setattr(orchestrator, "judge", fake_judge)
+
+
+def _minimal_plan() -> Plan:
+    """Return a minimal Plan suitable for test stubs."""
+    return Plan(
+        goal="test",
+        parts=[
+            PartSpec(
+                id="cube",
+                description="cube",
+                primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+
+
+def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan_obj: Plan) -> None:
+    """Stub llm.plan to return a fixed Plan."""
+
+    async def fake_plan(_cfg: Any, _goal: str) -> tuple[Plan, int, int]:
+        return plan_obj, 50, 25
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+
+
+def _patch_empty_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub gather_scene_snapshot to return an empty scene without an MCP call.
+    Avoids polluting fake_mcp.calls for tests that inspect them."""
+
+    async def fake_snapshot(_mcp: Any, _plan: Plan) -> dict[str, Any]:
+        return {"objects": {}}
+
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
 
 
 async def test_happy_path_completes(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
+    _patch_empty_snapshot(monkeypatch)
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -164,6 +202,7 @@ async def test_happy_path_completes(
 async def test_stuck_streak_aborts(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -189,6 +228,7 @@ async def test_stuck_streak_aborts(
 async def test_cancel_event_breaks_loop(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     started = asyncio.Event()
 
     async def slow_stream(
@@ -223,6 +263,7 @@ async def test_cancel_event_breaks_loop(
 async def test_iteration_events_emitted(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -246,3 +287,345 @@ async def test_iteration_events_emitted(
     verdict_events = [e for e in events if isinstance(e, CriticVerdictEvent)]
     assert [e.n for e in iter_starts] == [1, 2, 3]
     assert [v.verdict.status for v in verdict_events] == ["continue", "continue", "done"]
+
+
+async def test_auto_frame_runs_before_screenshot(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When framing.auto_frame=True and screenshots are on, orchestrator should
+    send a reframe script via execute_blender_code right before fetching the
+    screenshot."""
+    _patch_plan(monkeypatch, _minimal_plan())
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="placed cube", done=True)]]),
+    )
+    _patch_judge(
+        monkeypatch,
+        [Verdict(status="done", reasoning="ok", confidence=0.9)],
+    )
+
+    settings = _settings(max_iter=1)
+    # Turn screenshots on for this test
+    settings.loop.screenshot_every_step = True
+    settings.framing.auto_frame = True
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    names = [c[0] for c in fake_mcp.calls]
+    # The reframe must precede the screenshot fetch — that's the whole point.
+    assert "execute_blender_code" in names
+    assert "get_screenshot" in names
+    assert names.index("execute_blender_code") < names.index("get_screenshot")
+    # And the reframe call must carry a non-empty Blender script.
+    reframe_calls = [c for c in fake_mcp.calls if c[0] == "execute_blender_code"]
+    assert any("bpy" in c[1].get("code", "") for c in reframe_calls)
+
+
+async def test_auto_frame_skipped_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
+    _patch_empty_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="noop", done=True)]]),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+    settings.loop.screenshot_every_step = True
+    settings.framing.auto_frame = False
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    reframe_calls = [
+        c for c in fake_mcp.calls
+        if c[0] == "execute_blender_code" and "bpy" in c[1].get("code", "")
+    ]
+    assert reframe_calls == []
+
+
+async def test_planner_runs_once_at_start(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    plan_obj = Plan(
+        goal="cube on table",
+        parts=[
+            PartSpec(
+                id="cube",
+                description="cube",
+                primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    call_count = {"n": 0}
+
+    async def fake_plan(_cfg: Any, _goal: str) -> tuple[Plan, int, int]:
+        call_count["n"] += 1
+        return plan_obj, 50, 25
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="ok", done=True)]]),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "cube on table", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    # Planner ran exactly once at the start.
+    assert call_count["n"] == 1
+
+
+async def test_actor_proposals_are_accumulated(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When the Actor emits PROPOSED_ADDITION blocks in its text, the orchestrator
+    must collect them into pending_proposals (visible via the _LAST_PROPOSALS
+    module-level test seam)."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_obj = Plan(
+        goal="x", parts=[
+            PartSpec(
+                id="t", description="t", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    _patch_plan(monkeypatch, plan_obj)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [
+                [
+                    ActorDelta(
+                        text="placing cube.\nPROPOSED_ADDITION: a book on the table\n",
+                        done=True,
+                    )
+                ]
+            ]
+        ),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    proposals = orchestrator._LAST_PROPOSALS
+    assert len(proposals) == 1
+    assert "book on the table" in proposals[0].description
+
+
+async def test_verifier_runs_each_step_and_feeds_actor(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """After each Actor turn, orchestrator must call gather_scene_snapshot + verify
+    and pass the diff into the Critic's judge() via plan= and diff= kwargs."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_obj = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    _patch_plan(monkeypatch, plan_obj)
+
+    # Return a scene with the cube present + correct so the diff is "ok".
+    async def fake_snapshot(_mcp: Any, _plan: Plan) -> dict:
+        return {
+            "objects": {
+                "a": {
+                    "primitive_guess": "cube",
+                    "vert_count": 8,
+                    "world_location": [0.0, 0.0, 0.0],
+                    "world_bbox_min": [-0.5, -0.5, -0.5],
+                    "world_bbox_max": [0.5, 0.5, 0.5],
+                    "rotation_euler_deg": [0.0, 0.0, 0.0],
+                }
+            }
+        }
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_judge(
+        _cfg: Any, _system: str, _goal: str, transcript: str, _shot: Any,
+        *, plan: Plan | None = None, diff: Any = None, **_kw: Any
+    ) -> tuple[Verdict, int, int]:
+        captured["plan_in_judge"] = plan
+        captured["diff_in_judge"] = diff
+        return Verdict(status="done", reasoning="ok", confidence=0.9), 10, 5
+    monkeypatch.setattr(orchestrator, "judge", fake_judge)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="placed", done=True)]]),
+    )
+
+    settings = _settings(max_iter=1)
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    assert captured["plan_in_judge"] is plan_obj
+    assert captured["diff_in_judge"] is not None
+    assert captured["diff_in_judge"].parts[0].status == "ok"
+
+
+async def test_structural_mismatch_triggers_replan_under_budget(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When Critic returns structural_mismatch and max_replans > 0, the
+    orchestrator must call llm.replan and continue with the new plan."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec, VerifierDiff
+
+    plan_v1 = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+        version=1,
+    )
+    plan_v2 = plan_v1.model_copy(update={"version": 2, "scene_notes": "revised"})
+
+    plan_calls = {"n": 0}
+
+    async def fake_plan(_c: Any, _g: str) -> tuple[Plan, int, int]:
+        plan_calls["n"] += 1
+        return plan_v1, 50, 25
+
+    replan_calls = {"n": 0}
+
+    async def fake_replan(
+        _c: Any, *, prior: Plan, diff: VerifierDiff, recent_actions: str,
+        proposals: list[Any], screenshot_png: Any = None,
+    ) -> tuple[Plan, int, int]:
+        replan_calls["n"] += 1
+        return plan_v2, 60, 30
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+    monkeypatch.setattr(orchestrator, "replan", fake_replan)
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [
+                [ActorDelta(text="step 1", done=True)],
+                [ActorDelta(text="step 2", done=True)],
+            ]
+        ),
+    )
+    _patch_judge(
+        monkeypatch,
+        [
+            Verdict(status="structural_mismatch", reasoning="bad plan",
+                    replan_reason="resize cube", confidence=0.7),
+            Verdict(status="done", reasoning="ok", confidence=0.9),
+        ],
+    )
+
+    async def fake_snapshot(_m: Any, _p: Plan) -> dict:
+        return {"objects": {}}
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    settings = _settings(max_iter=5)
+    settings.loop.max_replans = 1
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    events = await _collect_events(bus, run_task)
+
+    assert plan_calls["n"] == 1
+    assert replan_calls["n"] == 1
+    finished = events[-1]
+    assert isinstance(finished, RunFinished)
+    assert finished.outcome.status == "done"
+
+
+async def test_structural_mismatch_with_zero_budget_exits_stuck(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """With max_replans=0, a structural_mismatch verdict counts as stuck and
+    is subject to the stuck_streak abort."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_v1 = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+
+    async def fake_plan(_c: Any, _g: str) -> tuple[Plan, int, int]:
+        return plan_v1, 50, 25
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+
+    async def fake_snapshot(_m: Any, _p: Plan) -> dict:
+        return {"objects": {}}
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [[ActorDelta(text=f"s{i}", done=True)] for i in range(5)]
+        ),
+    )
+    _patch_judge(
+        monkeypatch,
+        [
+            Verdict(status="structural_mismatch", reasoning="bad", confidence=0.5),
+            Verdict(status="structural_mismatch", reasoning="bad", confidence=0.5),
+        ],
+    )
+
+    settings = _settings(max_iter=5, stuck_streak=2)
+    settings.loop.max_replans = 0
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    events = await _collect_events(bus, run_task)
+    finished = events[-1]
+    assert isinstance(finished, RunFinished)
+    assert finished.outcome.status == "stuck"

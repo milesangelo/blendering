@@ -22,28 +22,61 @@ class ModelConfig(BaseModel):
     api_key_env: str = "OPENAI_API_KEY"
     temperature: float = 0.2
     max_tokens: int = 4096
+    # Optional USD pricing per 1M tokens — when set, cost is reported per run.
+    price_in_per_1m: float | None = None
+    price_out_per_1m: float | None = None
 
     @property
     def api_key(self) -> str | None:
         return os.environ.get(self.api_key_env)
 
 
+class PlannerConfig(ModelConfig):
+    """Same shape as ModelConfig — the Planner is just a third LLM role."""
+    pass
+
+
 class LoopConfig(BaseModel):
     max_iterations: int = 25
     screenshot_every_step: bool = True
     stop_on_stuck_streak: int = 3
+    max_replans: int = 0  # disabled by default; raise to 2 once tolerances are calibrated.
+
+
+class FramingConfig(BaseModel):
+    auto_frame: bool = True
+    padding: float = 0.15
+    min_distance: float = 2.0
+    exclude_tags: list[str] = Field(default_factory=lambda: ["_helper", "_guide"])
+
+
+class VerifierConfig(BaseModel):
+    dimension_tolerance: float = 0.15           # fractional, applied to each dim
+    position_tolerance: float = 0.10            # meters
+    orientation_tolerance_deg: float = 10.0
+    missing_is_structural: bool = True
+    off_threshold_for_structural: int = 2
 
 
 class Settings(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     actor: ModelConfig
     critic: ModelConfig
+    planner: PlannerConfig | None = None  # falls back to actor config if None
     loop: LoopConfig = Field(default_factory=LoopConfig)
+    framing: FramingConfig = Field(default_factory=FramingConfig)
+    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
 
     @model_validator(mode="after")
     def _check_api_keys(self) -> Settings:
         # Soft check — surface a clear error if the user forgot to export their key.
-        for role, mc in (("actor", self.actor), ("critic", self.critic)):
+        roles: list[tuple[str, ModelConfig]] = [
+            ("actor", self.actor),
+            ("critic", self.critic),
+        ]
+        if self.planner is not None:
+            roles.append(("planner", self.planner))
+        for role, mc in roles:
             if mc.api_key is None:
                 # We don't fail here; the LLM call will fail loudly. But warn via env marker.
                 os.environ.setdefault(f"_BLENDERING_MISSING_{role.upper()}_KEY", mc.api_key_env)

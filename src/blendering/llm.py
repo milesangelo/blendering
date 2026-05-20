@@ -11,7 +11,7 @@ import litellm
 from pydantic import ValidationError
 
 from .config import ModelConfig
-from .schemas import Verdict
+from .schemas import PartProposal, Plan, Verdict, VerifierDiff
 from .utils.images import encode_b64_data_url, thumbnail_bytes
 from .utils.logging import get_logger
 
@@ -26,6 +26,9 @@ class ActorDelta:
     # Partial tool calls accumulate across deltas; complete ones land in `finished_tool_calls`.
     finished_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     done: bool = False
+    # Final-chunk usage stats from the provider (only present once per call).
+    in_tokens: int | None = None
+    out_tokens: int | None = None
 
 
 def _model_kwargs(cfg: ModelConfig) -> dict[str, Any]:
@@ -55,12 +58,23 @@ async def stream_actor(
         tools=tools or None,
         tool_choice="auto" if tools else None,
         stream=True,
+        stream_options={"include_usage": True},
     )
 
     # Tool calls arrive in fragments — accumulate by index.
     partials: dict[int, dict[str, Any]] = {}
 
     async for chunk in response:
+        # Final usage-only chunk has no choices but carries `usage`.
+        usage = getattr(chunk, "usage", None)
+        if not chunk.choices:
+            if usage is not None:
+                yield ActorDelta(
+                    in_tokens=getattr(usage, "prompt_tokens", None),
+                    out_tokens=getattr(usage, "completion_tokens", None),
+                    done=True,
+                )
+            continue
         choice = chunk.choices[0]
         delta = choice.delta
         text = getattr(delta, "content", None) or ""
@@ -103,8 +117,9 @@ async def stream_actor(
 
 _VERDICT_INSTRUCTION = (
     "Respond ONLY with a JSON object matching this schema:\n"
-    '{"status": "continue"|"done"|"stuck", "reasoning": str, '
-    '"next_step_hint": str|null, "confidence": number in [0,1]}'
+    '{"status": "continue"|"done"|"stuck"|"structural_mismatch", '
+    '"reasoning": str, "next_step_hint": str|null, '
+    '"confidence": number in [0,1], "replan_reason": str|null}'
 )
 
 
@@ -114,18 +129,23 @@ async def judge(
     user_goal: str,
     transcript: str,
     screenshot_png: bytes | None,
-) -> Verdict:
+    *,
+    plan: Plan | None = None,
+    diff: VerifierDiff | None = None,
+) -> tuple[Verdict, int, int]:
     """Ask the Critic to evaluate the scene. Returns a validated Verdict."""
-    user_content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                f"USER GOAL:\n{user_goal}\n\n"
-                f"RECENT ACTOR TRANSCRIPT:\n{transcript}\n\n"
-                f"{_VERDICT_INSTRUCTION}"
-            ),
-        }
-    ]
+    text_parts = [f"USER GOAL:\n{user_goal}"]
+    if plan is not None:
+        text_parts.append(
+            f"ACTIVE PLAN (v{plan.version}):\n{plan.model_dump_json(indent=2)}"
+        )
+    if diff is not None:
+        text_parts.append(f"VERIFIER DIFF:\n{diff.model_dump_json(indent=2)}")
+    text_parts.append(f"RECENT ACTOR TRANSCRIPT:\n{transcript}")
+    text_parts.append(_VERDICT_INSTRUCTION)
+    text_block = "\n\n".join(text_parts)
+
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": text_block}]
     if screenshot_png is not None:
         small = thumbnail_bytes(screenshot_png)
         user_content.append(
@@ -153,8 +173,11 @@ async def judge(
             )
             text = resp.choices[0].message.content or "{}"
             log.debug("critic raw: %s", text[:500])
+            usage = getattr(resp, "usage", None)
+            in_tok = getattr(usage, "prompt_tokens", 0) if usage else 0
+            out_tok = getattr(usage, "completion_tokens", 0) if usage else 0
             data = json.loads(_strip_fences(text))
-            return Verdict.model_validate(data)
+            return Verdict.model_validate(data), in_tok, out_tok
         except (json.JSONDecodeError, ValidationError) as exc:
             if attempt == 0:
                 messages.append(
@@ -167,10 +190,14 @@ async def judge(
                     }
                 )
                 continue
-            return Verdict(
-                status="stuck",
-                reasoning=f"Critic returned invalid JSON twice: {exc}",
-                confidence=0.0,
+            return (
+                Verdict(
+                    status="stuck",
+                    reasoning=f"Critic returned invalid JSON twice: {exc}",
+                    confidence=0.0,
+                ),
+                0,
+                0,
             )
     # Unreachable; satisfy type checker.
     raise RuntimeError("judge() exited loop without returning")
@@ -184,3 +211,97 @@ def _strip_fences(text: str) -> str:
         if "\n" in t:
             t = t.split("\n", 1)[1]
     return t.strip()
+
+
+_PLAN_INSTRUCTION = (
+    "Respond ONLY with a JSON object matching the Plan schema in the system prompt."
+)
+
+
+async def plan(cfg: ModelConfig, user_goal: str) -> tuple[Plan, int, int]:
+    """Initial plan — produce a Plan from the user's goal. Validates against the
+    Plan schema; retries once on failure with the error attached."""
+    from .prompts import PLANNER_SYSTEM
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "user", "content": f"USER GOAL:\n{user_goal}\n\n{_PLAN_INSTRUCTION}"},
+    ]
+    return await _plan_completion(cfg, messages)
+
+
+async def replan(
+    cfg: ModelConfig,
+    prior: Plan,
+    diff: VerifierDiff,
+    recent_actions: str,
+    proposals: list[PartProposal],
+    screenshot_png: bytes | None = None,
+) -> tuple[Plan, int, int]:
+    """Revise an existing Plan based on the Verifier diff, recent Actor actions,
+    and any pending part proposals."""
+    from .prompts import REPLANNER_SYSTEM
+
+    proposal_block = (
+        "\n".join(
+            f"- {p.description}" + (f"  (rationale: {p.rationale})" if p.rationale else "")
+            for p in proposals
+        )
+        if proposals
+        else "(none)"
+    )
+    text_block = (
+        f"PRIOR PLAN (version {prior.version}):\n{prior.model_dump_json(indent=2)}\n\n"
+        f"VERIFIER DIFF:\n{diff.model_dump_json(indent=2)}\n\n"
+        f"RECENT ACTOR ACTIONS:\n{recent_actions}\n\n"
+        f"PART PROPOSALS FROM ACTOR:\n{proposal_block}\n\n"
+        f"{_PLAN_INSTRUCTION}"
+    )
+
+    user_content: Any = text_block
+    if screenshot_png is not None:
+        small = thumbnail_bytes(screenshot_png)
+        user_content = [
+            {"type": "text", "text": text_block},
+            {"type": "image_url", "image_url": {"url": encode_b64_data_url(small)}},
+        ]
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": REPLANNER_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    return await _plan_completion(cfg, messages)
+
+
+async def _plan_completion(
+    cfg: ModelConfig, messages: list[dict[str, Any]]
+) -> tuple[Plan, int, int]:
+    for attempt in range(2):
+        try:
+            log.debug("planner → %s attempt=%d", cfg.model, attempt + 1)
+            resp = await litellm.acompletion(
+                **_model_kwargs(cfg),
+                messages=messages,
+                response_format={"type": "json_object"},
+                stream=False,
+            )
+            text = resp.choices[0].message.content or "{}"
+            usage = getattr(resp, "usage", None)
+            in_tok = getattr(usage, "prompt_tokens", 0) if usage else 0
+            out_tok = getattr(usage, "completion_tokens", 0) if usage else 0
+            data = json.loads(_strip_fences(text))
+            return Plan.model_validate(data), in_tok, out_tok
+        except (json.JSONDecodeError, ValidationError) as exc:
+            if attempt == 0:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your previous response failed validation: {exc}. "
+                            "Reply ONLY with a valid Plan JSON object."
+                        ),
+                    }
+                )
+                continue
+            raise RuntimeError(f"Planner returned invalid Plan twice: {exc}") from exc
+    raise RuntimeError("_plan_completion exited loop without returning")
