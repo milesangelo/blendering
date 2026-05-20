@@ -14,7 +14,8 @@ from .framing import reframe_script
 from .llm import judge, plan, stream_actor
 from .mcp_client import BlenderMCP, mcp_client
 from .prompts import ACTOR_SYSTEM, CRITIC_SYSTEM
-from .schemas import PartProposal, Plan, RunOutcome, Verdict
+from .schemas import PartProposal, Plan, RunOutcome, Verdict, VerifierDiff
+from .verifier import verify
 from .tui.events import (
     ActorTextDelta,
     CriticVerdictEvent,
@@ -190,6 +191,54 @@ async def _run_actor_turn(
             appended.append(messages[-1])
 
 
+async def gather_scene_snapshot(mcp: BlenderMCP, plan: Plan) -> dict[str, Any]:
+    """Snapshot all mesh objects in the scene in the shape the Verifier expects.
+    Uses a single execute_blender_code call to inspect everything at once —
+    cheaper than N per-object MCP round-trips."""
+    script = """
+import bpy, json
+out = {"objects": {}}
+for o in bpy.context.scene.objects:
+    if o.type != "MESH":
+        continue
+    me = o.data
+    vert_count = len(me.vertices) if me else 0
+    mn = [float("inf")] * 3
+    mx = [float("-inf")] * 3
+    import mathutils
+    for corner in o.bound_box:
+        wc = o.matrix_world @ mathutils.Vector(corner)
+        for i in range(3):
+            mn[i] = min(mn[i], wc[i])
+            mx[i] = max(mx[i], wc[i])
+    rot_deg = [r * 180.0 / 3.141592653589793 for r in o.rotation_euler]
+    if vert_count == 8:
+        prim = "cube"
+    elif vert_count == 4:
+        prim = "plane"
+    else:
+        prim = "mesh"
+    out["objects"][o.name] = {
+        "primitive_guess": prim,
+        "vert_count": vert_count,
+        "world_location": [o.location.x, o.location.y, o.location.z],
+        "world_bbox_min": mn,
+        "world_bbox_max": mx,
+        "rotation_euler_deg": rot_deg,
+    }
+print(json.dumps(out))
+"""
+    result = await mcp.call_tool("execute_blender_code", {"code": script})
+    text = (result.text or "").strip()
+    start = text.rfind("{")
+    if start < 0:
+        return {"objects": {}}
+    try:
+        return json.loads(text[start:])
+    except json.JSONDecodeError:
+        return {"objects": {}}
+
+
 async def run(
     settings: Settings,
     user_prompt: str,
@@ -289,6 +338,22 @@ async def run(
                             ViewportUpdate(image_bytes=screenshot_bytes, path=str(path))
                         )
 
+                # Verifier — pure code, runs every step.
+                snapshot_task = asyncio.create_task(
+                    gather_scene_snapshot(mcp, current_plan)
+                )
+                try:
+                    snapshot = await _wait_or_cancel(snapshot_task, cancel)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await bus.post(
+                        StatusMessage(text=f"Snapshot failed: {exc}", level="warn")
+                    )
+                    snapshot = {"objects": {}}
+                last_diff: VerifierDiff = verify(current_plan, snapshot, settings.verifier)
+                await bus.post(StatusMessage(text=f"Verifier: {last_diff.summary}"))
+
                 # Critic
                 judge_task = asyncio.create_task(
                     judge(
@@ -297,6 +362,8 @@ async def run(
                         user_prompt,
                         transcript,
                         screenshot_bytes,
+                        plan=current_plan,
+                        diff=last_diff,
                     )
                 )
                 verdict, c_in, c_out = await _wait_or_cancel(judge_task, cancel)
@@ -334,8 +401,14 @@ async def run(
                 else:
                     stuck_streak = 0
 
-                # Inject critic feedback for next iteration.
+                # Inject Verifier + Critic feedback for next iteration.
+                off_lines = "\n".join(
+                    f"  - {p.part_id} ({p.status}): {'; '.join(p.issues) if p.issues else 'ok'}"
+                    for p in last_diff.parts
+                )
                 feedback = (
+                    f"VERIFIER DIFF (plan v{last_diff.plan_version}): {last_diff.summary}\n"
+                    f"{off_lines}\n"
                     f"Critic feedback (status={verdict.status}, "
                     f"confidence={verdict.confidence:.2f}):\n"
                     f"{verdict.reasoning}\n"

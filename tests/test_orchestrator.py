@@ -145,10 +145,21 @@ def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan_obj: Plan) -> None:
     monkeypatch.setattr(orchestrator, "plan", fake_plan)
 
 
+def _patch_empty_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub gather_scene_snapshot to return an empty scene without an MCP call.
+    Avoids polluting fake_mcp.calls for tests that inspect them."""
+
+    async def fake_snapshot(_mcp: Any, _plan: Plan) -> dict[str, Any]:
+        return {"objects": {}}
+
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+
 async def test_happy_path_completes(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
     _patch_plan(monkeypatch, _minimal_plan())
+    _patch_empty_snapshot(monkeypatch)
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -319,6 +330,7 @@ async def test_auto_frame_skipped_when_disabled(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
     _patch_plan(monkeypatch, _minimal_plan())
+    _patch_empty_snapshot(monkeypatch)
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -426,3 +438,66 @@ async def test_actor_proposals_are_accumulated(
     proposals = orchestrator._LAST_PROPOSALS
     assert len(proposals) == 1
     assert "book on the table" in proposals[0].description
+
+
+async def test_verifier_runs_each_step_and_feeds_actor(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """After each Actor turn, orchestrator must call gather_scene_snapshot + verify
+    and pass the diff into the Critic's judge() via plan= and diff= kwargs."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_obj = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    _patch_plan(monkeypatch, plan_obj)
+
+    # Return a scene with the cube present + correct so the diff is "ok".
+    async def fake_snapshot(_mcp: Any, _plan: Plan) -> dict:
+        return {
+            "objects": {
+                "a": {
+                    "primitive_guess": "cube",
+                    "vert_count": 8,
+                    "world_location": [0.0, 0.0, 0.0],
+                    "world_bbox_min": [-0.5, -0.5, -0.5],
+                    "world_bbox_max": [0.5, 0.5, 0.5],
+                    "rotation_euler_deg": [0.0, 0.0, 0.0],
+                }
+            }
+        }
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_judge(
+        _cfg: Any, _system: str, _goal: str, transcript: str, _shot: Any,
+        *, plan: Plan | None = None, diff: Any = None, **_kw: Any
+    ) -> tuple[Verdict, int, int]:
+        captured["plan_in_judge"] = plan
+        captured["diff_in_judge"] = diff
+        return Verdict(status="done", reasoning="ok", confidence=0.9), 10, 5
+    monkeypatch.setattr(orchestrator, "judge", fake_judge)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="placed", done=True)]]),
+    )
+
+    settings = _settings(max_iter=1)
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    assert captured["plan_in_judge"] is plan_obj
+    assert captured["diff_in_judge"] is not None
+    assert captured["diff_in_judge"].parts[0].status == "ok"

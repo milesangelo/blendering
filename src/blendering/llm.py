@@ -117,8 +117,9 @@ async def stream_actor(
 
 _VERDICT_INSTRUCTION = (
     "Respond ONLY with a JSON object matching this schema:\n"
-    '{"status": "continue"|"done"|"stuck", "reasoning": str, '
-    '"next_step_hint": str|null, "confidence": number in [0,1]}'
+    '{"status": "continue"|"done"|"stuck"|"structural_mismatch", '
+    '"reasoning": str, "next_step_hint": str|null, '
+    '"confidence": number in [0,1], "replan_reason": str|null}'
 )
 
 
@@ -128,18 +129,23 @@ async def judge(
     user_goal: str,
     transcript: str,
     screenshot_png: bytes | None,
+    *,
+    plan: Plan | None = None,
+    diff: VerifierDiff | None = None,
 ) -> tuple[Verdict, int, int]:
     """Ask the Critic to evaluate the scene. Returns a validated Verdict."""
-    user_content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                f"USER GOAL:\n{user_goal}\n\n"
-                f"RECENT ACTOR TRANSCRIPT:\n{transcript}\n\n"
-                f"{_VERDICT_INSTRUCTION}"
-            ),
-        }
-    ]
+    text_parts = [f"USER GOAL:\n{user_goal}"]
+    if plan is not None:
+        text_parts.append(
+            f"ACTIVE PLAN (v{plan.version}):\n{plan.model_dump_json(indent=2)}"
+        )
+    if diff is not None:
+        text_parts.append(f"VERIFIER DIFF:\n{diff.model_dump_json(indent=2)}")
+    text_parts.append(f"RECENT ACTOR TRANSCRIPT:\n{transcript}")
+    text_parts.append(_VERDICT_INSTRUCTION)
+    text_block = "\n\n".join(text_parts)
+
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": text_block}]
     if screenshot_png is not None:
         small = thumbnail_bytes(screenshot_png)
         user_content.append(

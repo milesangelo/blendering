@@ -40,6 +40,7 @@ class LoopConfig(BaseModel):
     max_iterations: int = 25
     screenshot_every_step: bool = True
     stop_on_stuck_streak: int = 3
+    max_replans: int = 0  # disabled by default; raise to 2 once tolerances are calibrated.
 
 
 class FramingConfig(BaseModel):
