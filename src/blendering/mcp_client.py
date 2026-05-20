@@ -12,6 +12,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from .config import MCPConfig
+from .utils.logging import get_logger
+
+log = get_logger("blendering.mcp")
 
 
 @dataclass
@@ -65,6 +68,7 @@ class BlenderMCP:
         return self._tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        log.debug("mcp call %s args=%s", name, arguments)
         result = await self._session.call_tool(name, arguments=arguments or {})
         text_parts: list[str] = []
         image_bytes: bytes | None = None

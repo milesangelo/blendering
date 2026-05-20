@@ -25,6 +25,9 @@ from .tui.events import (
     ViewportUpdate,
 )
 from .utils.images import save_screenshot
+from .utils.logging import get_logger
+
+log = get_logger("blendering.orchestrator")
 
 
 class EventBus:
@@ -88,12 +91,15 @@ async def _run_actor_turn(
         async def _drain() -> tuple[str, list[dict[str, Any]]]:
             text = ""
             finished: list[dict[str, Any]] = []
+            log.debug("actor: requesting completion (%d messages)", len(messages))
             async for delta in stream_actor(settings.actor, messages, tools_openai):
                 if delta.text:
                     text += delta.text
                     await bus.post(ActorTextDelta(delta.text))
                 if delta.finished_tool_calls:
                     finished.extend(delta.finished_tool_calls)
+            log.debug("actor: stream complete — %d chars text, %d tool calls",
+                      len(text), len(finished))
             return text, finished
 
         stream_task = asyncio.create_task(_drain())
@@ -128,6 +134,7 @@ async def _run_actor_turn(
 
         # Execute each tool call against MCP
         for tc, payload in zip(finished_tool_calls, tool_calls_payload, strict=True):
+            log.info("tool call: %s args=%s", tc["name"], tc["arguments"])
             await bus.post(ToolCallStart(name=tc["name"], arguments=tc["arguments"]))
             call_task = asyncio.create_task(mcp.call_tool(tc["name"], tc["arguments"]))
             try:
@@ -143,6 +150,8 @@ async def _run_actor_turn(
                 preview = _truncate(result_text)
                 is_error = result.is_error
 
+            log.info("tool result: %s%s — %s",
+                     tc["name"], " [ERR]" if is_error else "", _truncate(result_text, 200))
             await bus.post(
                 ToolCallResult(name=tc["name"], result_preview=preview, is_error=is_error)
             )
@@ -171,8 +180,11 @@ async def run(
     screenshot_dir = screenshot_dir or Path("screenshots")
 
     try:
+        log.info("starting run: %r", user_prompt)
         async with mcp_client(settings.mcp) as mcp:
             tools_openai = [t.to_openai() for t in mcp.tools]
+            log.info("MCP connected — %d tools: %s",
+                     len(tools_openai), [t.name for t in mcp.tools])
             await bus.post(
                 StatusMessage(text=f"MCP connected. {len(tools_openai)} tools available.")
             )
@@ -192,6 +204,7 @@ async def run(
                     await bus.post(RunFinished(outcome))
                     return outcome
 
+                log.info("── iteration %d/%d ──", i, settings.loop.max_iterations)
                 await bus.post(IterationStart(n=i, total=settings.loop.max_iterations))
 
                 _, transcript = await _run_actor_turn(
@@ -228,6 +241,8 @@ async def run(
                 )
                 verdict = await _wait_or_cancel(judge_task, cancel)
                 last_verdict = verdict
+                log.info("critic verdict: status=%s confidence=%.2f hint=%r",
+                         verdict.status, verdict.confidence, verdict.next_step_hint)
                 await bus.post(CriticVerdictEvent(verdict))
 
                 if verdict.status == "done":
@@ -269,6 +284,8 @@ async def run(
         bus.post_nowait(RunFinished(outcome))
         return outcome
     except Exception as exc:
-        outcome = RunOutcome(status="error", iterations=0, error=repr(exc))
+        import traceback
+        tb = traceback.format_exc()
+        outcome = RunOutcome(status="error", iterations=0, error=f"{exc!r}\n{tb}")
         bus.post_nowait(RunFinished(outcome))
         return outcome

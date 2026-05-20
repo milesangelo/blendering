@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
 
 from .config import load_settings
+from .headless import main as run_headless_main
 from .tui.app import BlenderingApp
+from .utils.logging import setup_logging
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
@@ -23,11 +24,22 @@ _CONFIG_OPT = typer.Option(
     "-c",
     help="Path to config.yaml (defaults to ./config.yaml).",
 )
+_HEADLESS_OPT = typer.Option(
+    False,
+    "--headless",
+    help="Stream events to stdout instead of launching the TUI (for scripts / CI).",
+)
 
 
 @app.command()
-def run(prompt: str = _PROMPT_ARG, config: Path = _CONFIG_OPT) -> None:
+def run(
+    prompt: str = _PROMPT_ARG,
+    config: Path = _CONFIG_OPT,
+    headless: bool = _HEADLESS_OPT,
+) -> None:
     """Run the Actor+Critic agent against Blender via MCP."""
+    log_path = setup_logging()
+    console.print(f"[dim]log: {log_path}[/]")
     try:
         settings = load_settings(config)
     except FileNotFoundError as exc:
@@ -41,14 +53,14 @@ def run(prompt: str = _PROMPT_ARG, config: Path = _CONFIG_OPT) -> None:
             console.print(f"[yellow]warn:[/] {var.removeprefix('_BLENDERING_MISSING_')} "
                           f"model is missing API key (env: {envvar})")
 
+    if headless:
+        raise typer.Exit(code=run_headless_main(settings, prompt))
+
     tui = BlenderingApp(settings=settings, user_prompt=prompt)
     tui.run()
 
 
 def main() -> None:
-    # When the user types `blendering "<prompt>"` we don't want them to need a subcommand.
-    if len(sys.argv) >= 2 and sys.argv[1] not in {"run", "--help", "-h"}:
-        sys.argv.insert(1, "run")
     app()
 
 

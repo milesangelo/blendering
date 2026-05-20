@@ -13,6 +13,9 @@ from pydantic import ValidationError
 from .config import ModelConfig
 from .schemas import Verdict
 from .utils.images import encode_b64_data_url, thumbnail_bytes
+from .utils.logging import get_logger
+
+log = get_logger("blendering.llm")
 
 
 @dataclass
@@ -44,6 +47,8 @@ async def stream_actor(
     tools: list[dict[str, Any]],
 ) -> AsyncIterator[ActorDelta]:
     """Stream the Actor's response, yielding text deltas and completed tool calls."""
+    log.debug("actor → %s (api_base=%s) tools=%d msgs=%d",
+              cfg.model, cfg.api_base, len(tools), len(messages))
     response = await litellm.acompletion(
         **_model_kwargs(cfg),
         messages=messages,
@@ -139,6 +144,7 @@ async def judge(
 
     for attempt in range(2):
         try:
+            log.debug("critic → %s (api_base=%s) attempt=%d", cfg.model, cfg.api_base, attempt + 1)
             resp = await litellm.acompletion(
                 **_model_kwargs(cfg),
                 messages=messages,
@@ -146,6 +152,7 @@ async def judge(
                 stream=False,
             )
             text = resp.choices[0].message.content or "{}"
+            log.debug("critic raw: %s", text[:500])
             data = json.loads(_strip_fences(text))
             return Verdict.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
