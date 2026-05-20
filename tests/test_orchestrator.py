@@ -61,6 +61,7 @@ class FakeMCP(BlenderMCP):
         return ToolResult(text=f"ran {name}", image_bytes=None, is_error=False)
 
     async def get_screenshot(self, max_size: int = 1024) -> bytes | None:
+        self.calls.append(("get_screenshot", {"max_size": max_size}))
         return None
 
 
@@ -275,11 +276,13 @@ async def test_auto_frame_runs_before_screenshot(
     await _collect_events(bus, run_task)
 
     names = [c[0] for c in fake_mcp.calls]
-    # execute_blender_code (the reframe) must precede a screenshot attempt.
+    # The reframe must precede the screenshot fetch — that's the whole point.
     assert "execute_blender_code" in names
-    # The reframe call's code argument must contain the framing module's signature.
+    assert "get_screenshot" in names
+    assert names.index("execute_blender_code") < names.index("get_screenshot")
+    # And the reframe call must carry a non-empty Blender script.
     reframe_calls = [c for c in fake_mcp.calls if c[0] == "execute_blender_code"]
-    assert any("padding" in c[1].get("code", "") for c in reframe_calls)
+    assert any("bpy" in c[1].get("code", "") for c in reframe_calls)
 
 
 async def test_auto_frame_skipped_when_disabled(
@@ -303,6 +306,6 @@ async def test_auto_frame_skipped_when_disabled(
 
     reframe_calls = [
         c for c in fake_mcp.calls
-        if c[0] == "execute_blender_code" and "padding" in c[1].get("code", "")
+        if c[0] == "execute_blender_code" and "bpy" in c[1].get("code", "")
     ]
     assert reframe_calls == []
