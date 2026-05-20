@@ -11,7 +11,7 @@ from typing import Any
 from .config import Settings
 from .cost import CostMeter
 from .framing import reframe_script
-from .llm import judge, plan, stream_actor
+from .llm import judge, plan, replan, stream_actor
 from .mcp_client import BlenderMCP, mcp_client
 from .prompts import ACTOR_SYSTEM, CRITIC_SYSTEM
 from .schemas import PartProposal, Plan, RunOutcome, Verdict, VerifierDiff
@@ -284,6 +284,8 @@ async def run(
             stuck_streak = 0
             last_verdict: Verdict | None = None
             pending_proposals: list[PartProposal] = []
+            replan_count = 0
+            recent_actions_log: list[str] = []  # bounded summary fed to replan
 
             for i in range(1, settings.loop.max_iterations + 1):
                 if cancel.is_set():
@@ -301,6 +303,9 @@ async def run(
                     settings, mcp, messages, tools_openai, bus, cancel, meter
                 )
                 pending_proposals.extend(new_proposals)
+                recent_actions_log.append(transcript[:200])
+                if len(recent_actions_log) > 5:
+                    recent_actions_log.pop(0)
 
                 # Screenshot (preceded by auto-frame when enabled)
                 screenshot_bytes: bytes | None = None
@@ -386,6 +391,63 @@ async def run(
                     )
                     await bus.post(RunFinished(outcome))
                     return outcome
+                if verdict.status == "structural_mismatch":
+                    if replan_count < settings.loop.max_replans:
+                        replan_count += 1
+                        await bus.post(
+                            StatusMessage(
+                                text=f"Replanning ({replan_count}/{settings.loop.max_replans}): "
+                                f"{verdict.replan_reason or verdict.reasoning}"
+                            )
+                        )
+                        replan_task = asyncio.create_task(
+                            replan(
+                                settings.planner or settings.actor,
+                                prior=current_plan,
+                                diff=last_diff,
+                                recent_actions="\n".join(recent_actions_log),
+                                proposals=pending_proposals,
+                                screenshot_png=screenshot_bytes,
+                            )
+                        )
+                        try:
+                            new_plan, p_in, p_out = await _wait_or_cancel(replan_task, cancel)
+                        except asyncio.CancelledError:
+                            raise
+                        meter.planner.add(p_in, p_out)
+                        # Diff the plans for the Actor.
+                        prior_ids = {p.id for p in current_plan.parts}
+                        new_ids = {p.id for p in new_plan.parts}
+                        added = sorted(new_ids - prior_ids)
+                        removed = sorted(prior_ids - new_ids)
+                        plan_diff_msg = (
+                            f"Plan revised to v{new_plan.version}. "
+                            f"Added: {added or '[]'}. Removed: {removed or '[]'}."
+                        )
+                        await bus.post(StatusMessage(text=plan_diff_msg))
+
+                        current_plan = new_plan
+                        pending_proposals = []  # consumed by the replan
+                        stuck_streak = 0
+                        # Replace the Actor system prompt so it sees the new plan.
+                        actor_system = (
+                            ACTOR_SYSTEM
+                            + "\n\nACTIVE PLAN:\n"
+                            + current_plan.model_dump_json(indent=2)
+                        )
+                        messages[0] = {"role": "system", "content": actor_system}
+                        messages.append({"role": "user", "content": plan_diff_msg})
+                        continue
+                    else:
+                        # Out of replan budget — downgrade to stuck and fall through.
+                        verdict = verdict.model_copy(
+                            update={
+                                "status": "stuck",
+                                "reasoning": f"structural_mismatch with no replan budget: {verdict.reasoning}",
+                            }
+                        )
+                        last_verdict = verdict
+
                 if verdict.status == "stuck":
                     stuck_streak += 1
                     if stuck_streak >= settings.loop.stop_on_stuck_streak:

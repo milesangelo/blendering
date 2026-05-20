@@ -501,3 +501,131 @@ async def test_verifier_runs_each_step_and_feeds_actor(
     assert captured["plan_in_judge"] is plan_obj
     assert captured["diff_in_judge"] is not None
     assert captured["diff_in_judge"].parts[0].status == "ok"
+
+
+async def test_structural_mismatch_triggers_replan_under_budget(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When Critic returns structural_mismatch and max_replans > 0, the
+    orchestrator must call llm.replan and continue with the new plan."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec, VerifierDiff
+
+    plan_v1 = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+        version=1,
+    )
+    plan_v2 = plan_v1.model_copy(update={"version": 2, "scene_notes": "revised"})
+
+    plan_calls = {"n": 0}
+
+    async def fake_plan(_c: Any, _g: str) -> tuple[Plan, int, int]:
+        plan_calls["n"] += 1
+        return plan_v1, 50, 25
+
+    replan_calls = {"n": 0}
+
+    async def fake_replan(
+        _c: Any, *, prior: Plan, diff: VerifierDiff, recent_actions: str,
+        proposals: list[Any], screenshot_png: Any = None,
+    ) -> tuple[Plan, int, int]:
+        replan_calls["n"] += 1
+        return plan_v2, 60, 30
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+    monkeypatch.setattr(orchestrator, "replan", fake_replan)
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [
+                [ActorDelta(text="step 1", done=True)],
+                [ActorDelta(text="step 2", done=True)],
+            ]
+        ),
+    )
+    _patch_judge(
+        monkeypatch,
+        [
+            Verdict(status="structural_mismatch", reasoning="bad plan",
+                    replan_reason="resize cube", confidence=0.7),
+            Verdict(status="done", reasoning="ok", confidence=0.9),
+        ],
+    )
+
+    async def fake_snapshot(_m: Any, _p: Plan) -> dict:
+        return {"objects": {}}
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    settings = _settings(max_iter=5)
+    settings.loop.max_replans = 1
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    events = await _collect_events(bus, run_task)
+
+    assert plan_calls["n"] == 1
+    assert replan_calls["n"] == 1
+    finished = events[-1]
+    assert isinstance(finished, RunFinished)
+    assert finished.outcome.status == "done"
+
+
+async def test_structural_mismatch_with_zero_budget_exits_stuck(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """With max_replans=0, a structural_mismatch verdict counts as stuck and
+    is subject to the stuck_streak abort."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_v1 = Plan(
+        goal="x",
+        parts=[
+            PartSpec(
+                id="a", description="a", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+
+    async def fake_plan(_c: Any, _g: str) -> tuple[Plan, int, int]:
+        return plan_v1, 50, 25
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+
+    async def fake_snapshot(_m: Any, _p: Plan) -> dict:
+        return {"objects": {}}
+    monkeypatch.setattr(orchestrator, "gather_scene_snapshot", fake_snapshot)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [[ActorDelta(text=f"s{i}", done=True)] for i in range(5)]
+        ),
+    )
+    _patch_judge(
+        monkeypatch,
+        [
+            Verdict(status="structural_mismatch", reasoning="bad", confidence=0.5),
+            Verdict(status="structural_mismatch", reasoning="bad", confidence=0.5),
+        ],
+    )
+
+    settings = _settings(max_iter=5, stuck_streak=2)
+    settings.loop.max_replans = 0
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    events = await _collect_events(bus, run_task)
+    finished = events[-1]
+    assert isinstance(finished, RunFinished)
+    assert finished.outcome.status == "stuck"

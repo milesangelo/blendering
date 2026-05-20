@@ -29,6 +29,7 @@ loop:
   max_iterations: 25
   screenshot_every_step: true
   stop_on_stuck_streak: 3
+  max_replans: 2
 
 framing:
   # Pre-screenshot camera reframe so the Critic always sees a fitted view.
