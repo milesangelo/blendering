@@ -29,6 +29,11 @@ _HEADLESS_OPT = typer.Option(
     "--headless",
     help="Stream events to stdout instead of launching the TUI (for scripts / CI).",
 )
+_CLEAR_OPT = typer.Option(
+    False,
+    "--clear",
+    help="Wipe all objects from the Blender scene before the Planner runs.",
+)
 
 
 @app.command()
@@ -36,6 +41,7 @@ def run(
     prompt: str = _PROMPT_ARG,
     config: Path = _CONFIG_OPT,
     headless: bool = _HEADLESS_OPT,
+    clear: bool = _CLEAR_OPT,
 ) -> None:
     """Run the Actor+Critic agent against Blender via MCP."""
     log_path = setup_logging()
@@ -54,9 +60,9 @@ def run(
                           f"model is missing API key (env: {envvar})")
 
     if headless:
-        raise typer.Exit(code=run_headless_main(settings, prompt))
+        raise typer.Exit(code=run_headless_main(settings, prompt, clear_scene=clear))
 
-    tui = BlenderingApp(settings=settings, user_prompt=prompt)
+    tui = BlenderingApp(settings=settings, user_prompt=prompt, clear_scene=clear)
     tui.run()
 
 
