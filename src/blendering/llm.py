@@ -26,6 +26,9 @@ class ActorDelta:
     # Partial tool calls accumulate across deltas; complete ones land in `finished_tool_calls`.
     finished_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     done: bool = False
+    # Final-chunk usage stats from the provider (only present once per call).
+    in_tokens: int | None = None
+    out_tokens: int | None = None
 
 
 def _model_kwargs(cfg: ModelConfig) -> dict[str, Any]:
@@ -55,12 +58,23 @@ async def stream_actor(
         tools=tools or None,
         tool_choice="auto" if tools else None,
         stream=True,
+        stream_options={"include_usage": True},
     )
 
     # Tool calls arrive in fragments — accumulate by index.
     partials: dict[int, dict[str, Any]] = {}
 
     async for chunk in response:
+        # Final usage-only chunk has no choices but carries `usage`.
+        usage = getattr(chunk, "usage", None)
+        if not chunk.choices:
+            if usage is not None:
+                yield ActorDelta(
+                    in_tokens=getattr(usage, "prompt_tokens", None),
+                    out_tokens=getattr(usage, "completion_tokens", None),
+                    done=True,
+                )
+            continue
         choice = chunk.choices[0]
         delta = choice.delta
         text = getattr(delta, "content", None) or ""
@@ -114,7 +128,7 @@ async def judge(
     user_goal: str,
     transcript: str,
     screenshot_png: bytes | None,
-) -> Verdict:
+) -> tuple[Verdict, int, int]:
     """Ask the Critic to evaluate the scene. Returns a validated Verdict."""
     user_content: list[dict[str, Any]] = [
         {
@@ -153,8 +167,11 @@ async def judge(
             )
             text = resp.choices[0].message.content or "{}"
             log.debug("critic raw: %s", text[:500])
+            usage = getattr(resp, "usage", None)
+            in_tok = getattr(usage, "prompt_tokens", 0) if usage else 0
+            out_tok = getattr(usage, "completion_tokens", 0) if usage else 0
             data = json.loads(_strip_fences(text))
-            return Verdict.model_validate(data)
+            return Verdict.model_validate(data), in_tok, out_tok
         except (json.JSONDecodeError, ValidationError) as exc:
             if attempt == 0:
                 messages.append(
@@ -167,10 +184,14 @@ async def judge(
                     }
                 )
                 continue
-            return Verdict(
-                status="stuck",
-                reasoning=f"Critic returned invalid JSON twice: {exc}",
-                confidence=0.0,
+            return (
+                Verdict(
+                    status="stuck",
+                    reasoning=f"Critic returned invalid JSON twice: {exc}",
+                    confidence=0.0,
+                ),
+                0,
+                0,
             )
     # Unreachable; satisfy type checker.
     raise RuntimeError("judge() exited loop without returning")

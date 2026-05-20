@@ -110,11 +110,11 @@ def _make_stream(
 def _patch_judge(monkeypatch: pytest.MonkeyPatch, verdicts: list[Verdict]) -> None:
     it = iter(verdicts)
 
-    async def fake_judge(*_args: Any, **_kwargs: Any) -> Verdict:
+    async def fake_judge(*_args: Any, **_kwargs: Any) -> tuple[Verdict, int, int]:
         try:
-            return next(it)
+            return next(it), 100, 50
         except StopIteration:
-            return Verdict(status="done", reasoning="default", confidence=1.0)
+            return Verdict(status="done", reasoning="default", confidence=1.0), 100, 50
 
     monkeypatch.setattr(orchestrator, "judge", fake_judge)
 

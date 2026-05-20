@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .cost import CostMeter
 from .llm import judge, stream_actor
 from .mcp_client import BlenderMCP, mcp_client
 from .prompts import ACTOR_SYSTEM, CRITIC_SYSTEM
@@ -76,6 +77,7 @@ async def _run_actor_turn(
     tools_openai: list[dict[str, Any]],
     bus: EventBus,
     cancel: asyncio.Event,
+    meter: CostMeter,
 ) -> tuple[list[dict[str, Any]], str]:
     """Run one Actor turn (text + tool calls). Returns (new_messages, transcript_for_critic)."""
     accumulated_text = ""
@@ -98,6 +100,8 @@ async def _run_actor_turn(
                     await bus.post(ActorTextDelta(delta.text))
                 if delta.finished_tool_calls:
                     finished.extend(delta.finished_tool_calls)
+                if delta.in_tokens is not None and delta.out_tokens is not None:
+                    meter.actor.add(delta.in_tokens, delta.out_tokens)
             log.debug("actor: stream complete — %d chars text, %d tool calls",
                       len(text), len(finished))
             return text, finished
@@ -195,6 +199,7 @@ async def run(
             ]
             stuck_streak = 0
             last_verdict: Verdict | None = None
+            meter = CostMeter()
 
             for i in range(1, settings.loop.max_iterations + 1):
                 if cancel.is_set():
@@ -208,7 +213,7 @@ async def run(
                 await bus.post(IterationStart(n=i, total=settings.loop.max_iterations))
 
                 _, transcript = await _run_actor_turn(
-                    settings, mcp, messages, tools_openai, bus, cancel
+                    settings, mcp, messages, tools_openai, bus, cancel, meter
                 )
 
                 # Screenshot
@@ -239,13 +244,20 @@ async def run(
                         screenshot_bytes,
                     )
                 )
-                verdict = await _wait_or_cancel(judge_task, cancel)
+                verdict, c_in, c_out = await _wait_or_cancel(judge_task, cancel)
+                meter.critic.add(c_in, c_out)
                 last_verdict = verdict
                 log.info("critic verdict: status=%s confidence=%.2f hint=%r",
                          verdict.status, verdict.confidence, verdict.next_step_hint)
                 await bus.post(CriticVerdictEvent(verdict))
+                step_line = meter.step_line(settings.actor, settings.critic)
+                log.info(step_line)
+                await bus.post(StatusMessage(text=step_line))
 
                 if verdict.status == "done":
+                    summary = meter.summary(settings.actor, settings.critic)
+                    log.info("run summary:\n%s", summary)
+                    await bus.post(StatusMessage(text=summary))
                     outcome = RunOutcome(
                         status="done", iterations=i, last_verdict=verdict
                     )
@@ -254,6 +266,9 @@ async def run(
                 if verdict.status == "stuck":
                     stuck_streak += 1
                     if stuck_streak >= settings.loop.stop_on_stuck_streak:
+                        summary = meter.summary(settings.actor, settings.critic)
+                        log.info("run summary:\n%s", summary)
+                        await bus.post(StatusMessage(text=summary))
                         outcome = RunOutcome(
                             status="stuck", iterations=i, last_verdict=verdict
                         )
@@ -271,6 +286,9 @@ async def run(
                 )
                 messages.append({"role": "user", "content": feedback})
 
+            summary = meter.summary(settings.actor, settings.critic)
+            log.info("run summary:\n%s", summary)
+            await bus.post(StatusMessage(text=summary))
             outcome = RunOutcome(
                 status="max_iterations",
                 iterations=settings.loop.max_iterations,

@@ -22,6 +22,9 @@ class ModelConfig(BaseModel):
     api_key_env: str = "OPENAI_API_KEY"
     temperature: float = 0.2
     max_tokens: int = 4096
+    # Optional USD pricing per 1M tokens — when set, cost is reported per run.
+    price_in_per_1m: float | None = None
+    price_out_per_1m: float | None = None
 
     @property
     def api_key(self) -> str | None:
