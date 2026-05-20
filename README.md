@@ -20,6 +20,25 @@ The loop runs until the Critic returns `done`, hits a stuck streak, hits max ite
 
 Vision-language models are usually the strongest judges of "does this scene look right" but are often *not* the strongest at long-horizon tool use. Letting a code/tool specialist drive while a separate vision model judges progress means you can pick the best model for each role independently. Model selection is per-role in `config.yaml`.
 
+## Why three models?
+
+This branch adds a **Planner** role between the user goal and the Actor. The
+Planner runs once at the start of each run to emit a structured `Plan`
+(list of parts with dimensions and positions). The Actor builds against
+that plan; a deterministic Verifier diffs the live scene against the plan
+after every step and feeds the diff to both the Actor and the Critic.
+
+The Critic gains a `structural_mismatch` verdict that triggers a Planner
+*replan* — capped by `loop.max_replans` — when the plan itself is the
+problem (vs. the Actor just needing a nudge).
+
+Auto-framing also added: before each screenshot, the orchestrator reframes
+the active camera around the scene AABB so the Critic never sees clipped
+content.
+
+See `docs/superpowers/specs/2026-05-20-blender-agent-accuracy-design.md`
+for the full design.
+
 ## Install
 
 ```bash
