@@ -36,3 +36,12 @@ framing:
   padding: 0.15
   min_distance: 2.0
   exclude_tags: ["_helper", "_guide"]
+
+planner:
+  # Optional. Omit this section to reuse the actor config for planning.
+  # Recommended: point at a stronger reasoning model.
+  model: "openai/Qwen/Qwen2.5-72B-Instruct"
+  api_base: "https://api.siliconflow.cn/v1"
+  api_key_env: "SILICONFLOW_API_KEY"
+  temperature: 0.3
+  max_tokens: 2048

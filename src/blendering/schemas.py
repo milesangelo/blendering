@@ -94,3 +94,13 @@ class PartProposal(BaseModel):
 
     description: str
     rationale: str | None = None
+
+
+class VerifierDiff(BaseModel):
+    """Stub — full definition lands in Task 7."""
+
+    plan_version: int = 0
+    parts: list[Any] = Field(default_factory=list)
+    extras: list[str] = Field(default_factory=list)
+    summary: str = ""
+    is_structural: bool = False

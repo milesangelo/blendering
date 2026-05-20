@@ -31,6 +31,7 @@ class RoleUsage:
 class CostMeter:
     actor: RoleUsage = field(default_factory=RoleUsage)
     critic: RoleUsage = field(default_factory=RoleUsage)
+    planner: RoleUsage = field(default_factory=RoleUsage)
 
     def step_line(self, actor_cfg: ModelConfig, critic_cfg: ModelConfig) -> str:
         ac = self.actor.cost(actor_cfg)
@@ -40,7 +41,8 @@ class CostMeter:
             cost_part = f"  step≈${ac + cc:.4f} (cum)"
         return (
             f"tokens — actor: {self.actor.in_tokens} in / {self.actor.out_tokens} out  "
-            f"critic: {self.critic.in_tokens} in / {self.critic.out_tokens} out{cost_part}"
+            f"critic: {self.critic.in_tokens} in / {self.critic.out_tokens} out  "
+            f"planner: {self.planner.in_tokens} in / {self.planner.out_tokens} out{cost_part}"
         )
 
     def summary(self, actor_cfg: ModelConfig, critic_cfg: ModelConfig) -> str:

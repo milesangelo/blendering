@@ -13,7 +13,7 @@ from blendering.config import LoopConfig, MCPConfig, ModelConfig, Settings
 from blendering.llm import ActorDelta
 from blendering.mcp_client import BlenderMCP, ToolResult, ToolSpec
 from blendering.orchestrator import EventBus, run
-from blendering.schemas import Verdict
+from blendering.schemas import PartSpec, Plan, PositionSpec, Verdict
 from blendering.tui.events import (
     CriticVerdictEvent,
     IterationStart,
@@ -120,9 +120,35 @@ def _patch_judge(monkeypatch: pytest.MonkeyPatch, verdicts: list[Verdict]) -> No
     monkeypatch.setattr(orchestrator, "judge", fake_judge)
 
 
+def _minimal_plan() -> Plan:
+    """Return a minimal Plan suitable for test stubs."""
+    return Plan(
+        goal="test",
+        parts=[
+            PartSpec(
+                id="cube",
+                description="cube",
+                primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+
+
+def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan_obj: Plan) -> None:
+    """Stub llm.plan to return a fixed Plan."""
+
+    async def fake_plan(_cfg: Any, _goal: str) -> tuple[Plan, int, int]:
+        return plan_obj, 50, 25
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+
+
 async def test_happy_path_completes(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -165,6 +191,7 @@ async def test_happy_path_completes(
 async def test_stuck_streak_aborts(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -190,6 +217,7 @@ async def test_stuck_streak_aborts(
 async def test_cancel_event_breaks_loop(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     started = asyncio.Event()
 
     async def slow_stream(
@@ -224,6 +252,7 @@ async def test_cancel_event_breaks_loop(
 async def test_iteration_events_emitted(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -255,6 +284,7 @@ async def test_auto_frame_runs_before_screenshot(
     """When framing.auto_frame=True and screenshots are on, orchestrator should
     send a reframe script via execute_blender_code right before fetching the
     screenshot."""
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -288,6 +318,7 @@ async def test_auto_frame_runs_before_screenshot(
 async def test_auto_frame_skipped_when_disabled(
     monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
 ) -> None:
+    _patch_plan(monkeypatch, _minimal_plan())
     monkeypatch.setattr(
         orchestrator,
         "stream_actor",
@@ -309,3 +340,89 @@ async def test_auto_frame_skipped_when_disabled(
         if c[0] == "execute_blender_code" and "bpy" in c[1].get("code", "")
     ]
     assert reframe_calls == []
+
+
+async def test_planner_runs_once_at_start(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    plan_obj = Plan(
+        goal="cube on table",
+        parts=[
+            PartSpec(
+                id="cube",
+                description="cube",
+                primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    call_count = {"n": 0}
+
+    async def fake_plan(_cfg: Any, _goal: str) -> tuple[Plan, int, int]:
+        call_count["n"] += 1
+        return plan_obj, 50, 25
+
+    monkeypatch.setattr(orchestrator, "plan", fake_plan)
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="ok", done=True)]]),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "cube on table", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    # Planner ran exactly once at the start.
+    assert call_count["n"] == 1
+
+
+async def test_actor_proposals_are_accumulated(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When the Actor emits PROPOSED_ADDITION blocks in its text, the orchestrator
+    must collect them into pending_proposals (visible via the _LAST_PROPOSALS
+    module-level test seam)."""
+    from blendering.schemas import PartSpec, Plan, PositionSpec
+
+    plan_obj = Plan(
+        goal="x", parts=[
+            PartSpec(
+                id="t", description="t", primitive="cube",
+                dimensions={"x": 1.0, "y": 1.0, "z": 1.0},
+                position=PositionSpec(mode="absolute", xyz=(0.0, 0.0, 0.0)),
+            )
+        ],
+    )
+    _patch_plan(monkeypatch, plan_obj)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream(
+            [
+                [
+                    ActorDelta(
+                        text="placing cube.\nPROPOSED_ADDITION: a book on the table\n",
+                        done=True,
+                    )
+                ]
+            ]
+        ),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    proposals = orchestrator._LAST_PROPOSALS
+    assert len(proposals) == 1
+    assert "book on the table" in proposals[0].description

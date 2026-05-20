@@ -31,6 +31,11 @@ class ModelConfig(BaseModel):
         return os.environ.get(self.api_key_env)
 
 
+class PlannerConfig(ModelConfig):
+    """Same shape as ModelConfig — the Planner is just a third LLM role."""
+    pass
+
+
 class LoopConfig(BaseModel):
     max_iterations: int = 25
     screenshot_every_step: bool = True
@@ -48,13 +53,20 @@ class Settings(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     actor: ModelConfig
     critic: ModelConfig
+    planner: PlannerConfig | None = None  # falls back to actor config if None
     loop: LoopConfig = Field(default_factory=LoopConfig)
     framing: FramingConfig = Field(default_factory=FramingConfig)
 
     @model_validator(mode="after")
     def _check_api_keys(self) -> Settings:
         # Soft check — surface a clear error if the user forgot to export their key.
-        for role, mc in (("actor", self.actor), ("critic", self.critic)):
+        roles: list[tuple[str, ModelConfig]] = [
+            ("actor", self.actor),
+            ("critic", self.critic),
+        ]
+        if self.planner is not None:
+            roles.append(("planner", self.planner))
+        for role, mc in roles:
             if mc.api_key is None:
                 # We don't fail here; the LLM call will fail loudly. But warn via env marker.
                 os.environ.setdefault(f"_BLENDERING_MISSING_{role.upper()}_KEY", mc.api_key_env)
