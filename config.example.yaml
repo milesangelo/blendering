@@ -1,0 +1,31 @@
+# blendering configuration
+# Copy to config.yaml and edit. Environment variables in ${VAR} are expanded.
+
+mcp:
+  # Command that launches the Blender MCP server. ahujasid/blender-mcp is the default.
+  # Make sure the Blender add-on is installed and "Connect to MCP server" is enabled.
+  command: "uvx"
+  args: ["blender-mcp"]
+  env: {}
+
+actor:
+  # The "doer" — strong at tool-calling and code generation.
+  # LiteLLM model string. For SiliconFlow via OpenAI-compatible API use openai/<model>.
+  model: "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+  api_base: "https://api.siliconflow.cn/v1"
+  api_key_env: "SILICONFLOW_API_KEY"
+  temperature: 0.2
+  max_tokens: 4096
+
+critic:
+  # The "judge" — strong vision model that looks at viewport screenshots.
+  model: "openai/Qwen/Qwen2-VL-72B-Instruct"
+  api_base: "https://api.siliconflow.cn/v1"
+  api_key_env: "SILICONFLOW_API_KEY"
+  temperature: 0.1
+  max_tokens: 1024
+
+loop:
+  max_iterations: 25
+  screenshot_every_step: true
+  stop_on_stuck_streak: 3
