@@ -54,12 +54,8 @@ def verify(plan: Plan, snapshot: dict[str, Any], cfg: VerifierConfig) -> Verifie
                 f"vert_count {obj.get('vert_count')} unusual for primitive {part.primitive}"
             )
 
-        # Dimensions — for relative-positioned parts only check the face-normal axis
-        # (the perpendicular axes depend on how the part was modelled, not the face constraint).
-        dim_primary_axis: int | None = None
-        if part.position.mode == "relative" and part.position.anchor_face is not None:
-            dim_primary_axis = _face_axis(part.position.anchor_face)
-        dim_issues, dim_measured = _check_dimensions(part, obj, cfg, primary_axis=dim_primary_axis)
+        # Dimensions — check all three axes uniformly.
+        dim_issues, dim_measured = _check_dimensions(part, obj, cfg)
         issues.extend(dim_issues)
         measured.update(dim_measured)
 
@@ -164,24 +160,15 @@ def _expected_extents(part: PartSpec) -> tuple[float, float, float] | None:
 
 
 def _check_dimensions(
-    part: PartSpec,
-    obj: dict[str, Any],
-    cfg: VerifierConfig,
-    primary_axis: int | None = None,
+    part: PartSpec, obj: dict[str, Any], cfg: VerifierConfig
 ) -> tuple[list[str], dict[str, Any]]:
-    """Check dimensions against plan tolerances.
-
-    When *primary_axis* is given (0=x, 1=y, 2=z) only that axis is checked.
-    This is used for relative-positioned parts where only the face-normal axis
-    is reliable — the other extents may differ due to how the part was modelled.
-    """
+    """Check dimensions against plan tolerances on all three axes."""
     issues: list[str] = []
     extents = _extents(obj)
     expected = _expected_extents(part)
     if extents is None or expected is None:
         return issues, {"extents": extents}
-    axes = [(primary_axis, ("x", "y", "z")[primary_axis])] if primary_axis is not None else list(enumerate(("x", "y", "z")))
-    for axis_idx, axis in axes:
+    for axis_idx, axis in enumerate(("x", "y", "z")):
         exp = expected[axis_idx]
         if exp <= 0.0:
             continue

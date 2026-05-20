@@ -111,7 +111,16 @@ def test_relative_position_uses_anchor_top_face() -> None:
     snapshot = {
         "objects": {
             "table": _cube_snapshot("table", (0.0, 0.0, 0.0), 1.0),
-            "lamp_base": _cube_snapshot("lamp_base", (0.0, 0.0, 0.55), 0.1),
+            "lamp_base": {
+                "primitive_guess": "cube",
+                "vert_count": 8,
+                "world_location": [0.0, 0.0, 0.55],
+                # 0.2 x 0.2 footprint, 0.1 height — centered at (0, 0, 0.55) so
+                # its bottom face sits on the table top at z=0.5.
+                "world_bbox_min": [-0.1, -0.1, 0.5],
+                "world_bbox_max": [0.1, 0.1, 0.6],
+                "rotation_euler_deg": [0.0, 0.0, 0.0],
+            },
         }
     }
     diff = verify(plan, snapshot, _cfg())
