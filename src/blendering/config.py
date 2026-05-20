@@ -37,11 +37,19 @@ class LoopConfig(BaseModel):
     stop_on_stuck_streak: int = 3
 
 
+class FramingConfig(BaseModel):
+    auto_frame: bool = True
+    padding: float = 0.15
+    min_distance: float = 2.0
+    exclude_tags: list[str] = Field(default_factory=lambda: ["_helper", "_guide"])
+
+
 class Settings(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     actor: ModelConfig
     critic: ModelConfig
     loop: LoopConfig = Field(default_factory=LoopConfig)
+    framing: FramingConfig = Field(default_factory=FramingConfig)
 
     @model_validator(mode="after")
     def _check_api_keys(self) -> Settings:

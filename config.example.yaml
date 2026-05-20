@@ -29,3 +29,10 @@ loop:
   max_iterations: 25
   screenshot_every_step: true
   stop_on_stuck_streak: 3
+
+framing:
+  # Pre-screenshot camera reframe so the Critic always sees a fitted view.
+  auto_frame: true
+  padding: 0.15
+  min_distance: 2.0
+  exclude_tags: ["_helper", "_guide"]

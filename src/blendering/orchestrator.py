@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Settings
 from .cost import CostMeter
+from .framing import reframe_script
 from .llm import judge, stream_actor
 from .mcp_client import BlenderMCP, mcp_client
 from .prompts import ACTOR_SYSTEM, CRITIC_SYSTEM
@@ -216,9 +217,27 @@ async def run(
                     settings, mcp, messages, tools_openai, bus, cancel, meter
                 )
 
-                # Screenshot
+                # Screenshot (preceded by auto-frame when enabled)
                 screenshot_bytes: bytes | None = None
                 if settings.loop.screenshot_every_step:
+                    if settings.framing.auto_frame:
+                        script = reframe_script(
+                            padding=settings.framing.padding,
+                            min_distance=settings.framing.min_distance,
+                            exclude_tags=settings.framing.exclude_tags,
+                        )
+                        frame_task = asyncio.create_task(
+                            mcp.call_tool("execute_blender_code", {"code": script})
+                        )
+                        try:
+                            await _wait_or_cancel(frame_task, cancel)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            await bus.post(
+                                StatusMessage(text=f"Auto-frame failed: {exc}", level="warn")
+                            )
+
                     shot_task = asyncio.create_task(mcp.get_screenshot())
                     try:
                         screenshot_bytes = await _wait_or_cancel(shot_task, cancel)

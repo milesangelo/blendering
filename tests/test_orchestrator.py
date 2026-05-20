@@ -246,3 +246,63 @@ async def test_iteration_events_emitted(
     verdict_events = [e for e in events if isinstance(e, CriticVerdictEvent)]
     assert [e.n for e in iter_starts] == [1, 2, 3]
     assert [v.verdict.status for v in verdict_events] == ["continue", "continue", "done"]
+
+
+async def test_auto_frame_runs_before_screenshot(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    """When framing.auto_frame=True and screenshots are on, orchestrator should
+    send a reframe script via execute_blender_code right before fetching the
+    screenshot."""
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="placed cube", done=True)]]),
+    )
+    _patch_judge(
+        monkeypatch,
+        [Verdict(status="done", reasoning="ok", confidence=0.9)],
+    )
+
+    settings = _settings(max_iter=1)
+    # Turn screenshots on for this test
+    settings.loop.screenshot_every_step = True
+    settings.framing.auto_frame = True
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    names = [c[0] for c in fake_mcp.calls]
+    # execute_blender_code (the reframe) must precede a screenshot attempt.
+    assert "execute_blender_code" in names
+    # The reframe call's code argument must contain the framing module's signature.
+    reframe_calls = [c for c in fake_mcp.calls if c[0] == "execute_blender_code"]
+    assert any("padding" in c[1].get("code", "") for c in reframe_calls)
+
+
+async def test_auto_frame_skipped_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, fake_mcp: FakeMCP
+) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "stream_actor",
+        _make_stream([[ActorDelta(text="noop", done=True)]]),
+    )
+    _patch_judge(monkeypatch, [Verdict(status="done", reasoning="ok", confidence=0.9)])
+
+    settings = _settings(max_iter=1)
+    settings.loop.screenshot_every_step = True
+    settings.framing.auto_frame = False
+
+    bus = EventBus()
+    cancel = asyncio.Event()
+    run_task = asyncio.create_task(run(settings, "x", bus, cancel))
+    await _collect_events(bus, run_task)
+
+    reframe_calls = [
+        c for c in fake_mcp.calls
+        if c[0] == "execute_blender_code" and "padding" in c[1].get("code", "")
+    ]
+    assert reframe_calls == []
