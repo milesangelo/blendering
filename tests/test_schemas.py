@@ -10,6 +10,7 @@ from blendering.schemas import (
     Plan,
     PositionSpec,
 )
+from blendering.schemas import PartDiff, VerifierDiff
 
 
 def test_verdict_done_minimal() -> None:
@@ -110,3 +111,27 @@ def test_part_proposal_minimal() -> None:
     pp = PartProposal(description="a book on the table")
     assert pp.description == "a book on the table"
     assert pp.rationale is None
+
+
+def test_part_diff_status_values() -> None:
+    for s in ("ok", "off", "missing", "extra"):
+        d = PartDiff(part_id="x", status=s, issues=[], measured={})
+        assert d.status == s
+
+
+def test_verifier_diff_round_trip() -> None:
+    d = VerifierDiff(
+        plan_version=2,
+        parts=[
+            PartDiff(part_id="t", status="ok", issues=[], measured={"x": 1.0}),
+            PartDiff(part_id="lamp", status="off",
+                     issues=["height 0.42 vs plan 0.30 (40% over)"],
+                     measured={"height": 0.42}),
+        ],
+        extras=["StrayCube"],
+        summary="lamp off; 1 extra",
+        is_structural=False,
+    )
+    blob = d.model_dump_json()
+    restored = VerifierDiff.model_validate_json(blob)
+    assert restored == d

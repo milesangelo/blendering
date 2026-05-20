@@ -96,11 +96,20 @@ class PartProposal(BaseModel):
     rationale: str | None = None
 
 
-class VerifierDiff(BaseModel):
-    """Stub — full definition lands in Task 7."""
+class PartDiff(BaseModel):
+    """Per-part status from the Verifier."""
 
-    plan_version: int = 0
-    parts: list[Any] = Field(default_factory=list)
+    part_id: str
+    status: Literal["ok", "off", "missing", "extra"]
+    issues: list[str] = Field(default_factory=list)
+    measured: dict[str, Any] = Field(default_factory=dict)
+
+
+class VerifierDiff(BaseModel):
+    """Aggregated Verifier output for one step."""
+
+    plan_version: int
+    parts: list[PartDiff] = Field(default_factory=list)
     extras: list[str] = Field(default_factory=list)
     summary: str = ""
     is_structural: bool = False
