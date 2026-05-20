@@ -49,6 +49,14 @@ class FramingConfig(BaseModel):
     exclude_tags: list[str] = Field(default_factory=lambda: ["_helper", "_guide"])
 
 
+class VerifierConfig(BaseModel):
+    dimension_tolerance: float = 0.15           # fractional, applied to each dim
+    position_tolerance: float = 0.10            # meters
+    orientation_tolerance_deg: float = 10.0
+    missing_is_structural: bool = True
+    off_threshold_for_structural: int = 2
+
+
 class Settings(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     actor: ModelConfig
@@ -56,6 +64,7 @@ class Settings(BaseModel):
     planner: PlannerConfig | None = None  # falls back to actor config if None
     loop: LoopConfig = Field(default_factory=LoopConfig)
     framing: FramingConfig = Field(default_factory=FramingConfig)
+    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
 
     @model_validator(mode="after")
     def _check_api_keys(self) -> Settings:

@@ -45,3 +45,10 @@ planner:
   api_key_env: "SILICONFLOW_API_KEY"
   temperature: 0.3
   max_tokens: 2048
+
+verifier:
+  dimension_tolerance: 0.15
+  position_tolerance: 0.10
+  orientation_tolerance_deg: 10
+  missing_is_structural: true
+  off_threshold_for_structural: 2
