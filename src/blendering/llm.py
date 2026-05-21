@@ -133,14 +133,29 @@ async def judge(
     plan: Plan | None = None,
     diff: VerifierDiff | None = None,
 ) -> tuple[Verdict, int, int]:
-    """Ask the Critic to evaluate the scene. Returns a validated Verdict."""
+    """Ask the Critic to evaluate the scene. Returns a validated Verdict.
+
+    The user message stays deliberately compact — no Plan or VerifierDiff JSON
+    dumps — so the per-step input fits inside tight provider TPM quotas. The
+    Critic gets enough signal (goal + part ids + off/missing parts + extras +
+    transcript + screenshot) to make holistic and structural-mismatch calls."""
     text_parts = [f"USER GOAL:\n{user_goal}"]
     if plan is not None:
-        text_parts.append(
-            f"ACTIVE PLAN (v{plan.version}):\n{plan.model_dump_json(indent=2)}"
-        )
+        ids = ", ".join(p.id for p in plan.parts) or "(no parts)"
+        plan_line = f"ACTIVE PLAN: v{plan.version} — {len(plan.parts)} part(s): {ids}"
+        if plan.scene_notes:
+            plan_line += f"\nScene notes: {plan.scene_notes}"
+        text_parts.append(plan_line)
     if diff is not None:
-        text_parts.append(f"VERIFIER DIFF:\n{diff.model_dump_json(indent=2)}")
+        diff_lines = [f"VERIFIER DIFF (plan v{diff.plan_version}): {diff.summary}"]
+        for p in diff.parts:
+            if p.status == "ok":
+                continue  # summary line already counts these
+            issues = "; ".join(p.issues) if p.issues else "(no detail)"
+            diff_lines.append(f"  - {p.part_id} [{p.status}]: {issues}")
+        if diff.extras:
+            diff_lines.append(f"  extras (not in plan): {', '.join(diff.extras)}")
+        text_parts.append("\n".join(diff_lines))
     text_parts.append(f"RECENT ACTOR TRANSCRIPT:\n{transcript}")
     text_parts.append(_VERDICT_INSTRUCTION)
     text_block = "\n\n".join(text_parts)
