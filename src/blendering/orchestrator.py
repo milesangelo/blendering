@@ -229,14 +229,49 @@ for o in bpy.context.scene.objects:
 print(json.dumps(out))
 """
     result = await mcp.call_tool("execute_blender_code", {"code": script})
-    text = (result.text or "").strip()
-    start = text.rfind("{")
+    return _parse_snapshot_payload(result.text or "")
+
+
+def _parse_snapshot_payload(text: str) -> dict[str, Any]:
+    """Extract the snapshot JSON from blender-mcp's `execute_blender_code` output.
+
+    The MCP server wraps stdout with `Code executed successfully: <stdout>`,
+    so the snapshot JSON appears verbatim somewhere in there. We locate it by
+    the literal `{"objects":` sentinel produced by the snapshot script — using
+    a generic `{` search would trip on the deeply nested braces inside the
+    JSON itself."""
+    text = text.strip()
+    sentinel = '{"objects":'
+    start = text.find(sentinel)
     if start < 0:
         return {"objects": {}}
-    try:
-        return json.loads(text[start:])
-    except json.JSONDecodeError:
-        return {"objects": {}}
+    # Walk from the sentinel `{` to its matching `}`, respecting strings so
+    # braces inside string values don't fool us.
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return {"objects": {}}
+    return {"objects": {}}
 
 
 _CLEAR_SCENE_SCRIPT = """
