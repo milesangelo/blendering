@@ -239,12 +239,35 @@ print(json.dumps(out))
         return {"objects": {}}
 
 
+_CLEAR_SCENE_SCRIPT = """
+import bpy
+# Remove every object first, then purge orphan data so freshly-created objects
+# with the same name as a prior part don't collide.
+for obj in list(bpy.context.scene.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
+for collection in (
+    bpy.data.meshes,
+    bpy.data.materials,
+    bpy.data.images,
+    bpy.data.cameras,
+    bpy.data.lights,
+    bpy.data.curves,
+    bpy.data.armatures,
+):
+    for item in list(collection):
+        if item.users == 0:
+            collection.remove(item)
+""".lstrip()
+
+
 async def run(
     settings: Settings,
     user_prompt: str,
     bus: EventBus,
     cancel: asyncio.Event,
     screenshot_dir: Path | None = None,
+    *,
+    clear_scene: bool = False,
 ) -> RunOutcome:
     """Drive the full Actor+Critic loop."""
     screenshot_dir = screenshot_dir or Path("screenshots")
@@ -258,6 +281,20 @@ async def run(
             await bus.post(
                 StatusMessage(text=f"MCP connected. {len(tools_openai)} tools available.")
             )
+
+            if clear_scene:
+                clear_task = asyncio.create_task(
+                    mcp.call_tool("execute_blender_code", {"code": _CLEAR_SCENE_SCRIPT})
+                )
+                try:
+                    await _wait_or_cancel(clear_task, cancel)
+                    await bus.post(StatusMessage(text="Scene cleared."))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await bus.post(
+                        StatusMessage(text=f"Clear scene failed: {exc}", level="warn")
+                    )
 
             meter = CostMeter()
 

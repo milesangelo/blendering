@@ -71,7 +71,9 @@ def _render(event: Any) -> None:
     console.file.flush()
 
 
-async def run_headless(settings: Settings, user_prompt: str) -> RunOutcome:
+async def run_headless(
+    settings: Settings, user_prompt: str, clear_scene: bool = False
+) -> RunOutcome:
     bus = EventBus()
     cancel = asyncio.Event()
 
@@ -80,7 +82,9 @@ async def run_headless(settings: Settings, user_prompt: str) -> RunOutcome:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, cancel.set)
 
-    run_task = asyncio.create_task(run(settings, user_prompt, bus, cancel))
+    run_task = asyncio.create_task(
+        run(settings, user_prompt, bus, cancel, clear_scene=clear_scene)
+    )
     outcome: RunOutcome | None = None
     while True:
         event = await bus.get()
@@ -93,8 +97,8 @@ async def run_headless(settings: Settings, user_prompt: str) -> RunOutcome:
     return outcome
 
 
-def main(settings: Settings, user_prompt: str) -> int:
-    outcome = asyncio.run(run_headless(settings, user_prompt))
+def main(settings: Settings, user_prompt: str, clear_scene: bool = False) -> int:
+    outcome = asyncio.run(run_headless(settings, user_prompt, clear_scene=clear_scene))
     return 0 if outcome.status == "done" else 1
 
 

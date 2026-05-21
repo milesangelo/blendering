@@ -103,10 +103,13 @@ class BlenderingApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, settings: Settings, user_prompt: str) -> None:
+    def __init__(
+        self, settings: Settings, user_prompt: str, clear_scene: bool = False
+    ) -> None:
         super().__init__()
         self.settings = settings
         self.user_prompt = user_prompt
+        self.clear_scene = clear_scene
         self.bus = EventBus()
         self.cancel = asyncio.Event()
         self._run_task: asyncio.Task[Any] | None = None
@@ -132,7 +135,13 @@ class BlenderingApp(App[None]):
         self.status.set_state(iteration=0, total=self._total, running=True)
         self.log_widget.write(Text.from_markup(f"[bold]Goal:[/] {self.user_prompt}"))
         self._run_task = asyncio.create_task(
-            run(self.settings, self.user_prompt, self.bus, self.cancel)
+            run(
+                self.settings,
+                self.user_prompt,
+                self.bus,
+                self.cancel,
+                clear_scene=self.clear_scene,
+            )
         )
         self._consumer_task = asyncio.create_task(self._consume_events())
 
